@@ -1,0 +1,811 @@
+#!/usr/bin/env python3
+# Commandline control of R&S HM804x PSU over TCP/IP
+
+__author__ = "Mads Meisner-Jensen"
+import os
+import sys
+import argparse
+import time
+import socket
+import re
+import enum
+import inspect
+from pprint import pprint
+
+PORT_DEFAULT=5025
+HOSTNAME_DEFAULT = "192.168.2.21:{}".format(PORT_DEFAULT)
+
+# Default instrument type to search for with -l option
+MDNS_SEARCHFOR_NAME = "HMC804"
+
+# mDNS service type to search for with -l option
+MDNS_SERVICE = "_lxi._tcp.local."
+
+
+################################################################################
+# Simple console colouring (Mads Meisner-Jensen)
+################################################################################
+
+import collections
+
+Color = collections.namedtuple('Color', "reset black red green yellow blue magenta cyan white grey ired igreen iyellow iblue imagenta icyan iwhite")
+Color.__new__.__defaults__ = ("",) * len(Color._fields)
+
+if sys.stdout.isatty() and os.name != 'nt':
+    fg = Color(reset="\033[0m",black="\033[30m",red="\033[31m",green="\033[32m",yellow="\033[33m",blue="\033[34m",magenta="\033[35m",cyan="\033[36m",white="\033[37m",
+               grey="\033[90m",ired="\033[91m",igreen="\033[92m",iyellow="\033[93m",iblue="\033[94m",imagenta="\033[95m",icyan="\033[96m",iwhite="\033[97m")
+else:
+    fg = Color()
+
+class Log(object):
+    verbose = 0
+
+    class Level(enum.IntEnum):
+        Note = 0
+        Info = 1
+        Verb = 2
+        Debug = 3
+
+    LEVEL_COLOR = [ fg.igreen, fg.icyan, fg.cyan, fg.imagenta ]
+
+    @staticmethod
+    def print(level, fmt, *args, **kwargs):
+        """bw stands for black and white (no color)"""
+        if Log.verbose >= level:
+            msg = fmt.format(*args, **kwargs)
+            if kwargs.pop('bw', False):
+                print(msg)
+            else:
+                print(Log.LEVEL_COLOR[level] + msg + fg.reset)
+
+    @staticmethod
+    def note(fmt, *args, **kwargs):
+        Log.print(Log.Level.Note, fmt, *args, **kwargs)
+
+    @staticmethod
+    def info(fmt, *args, **kwargs):
+        Log.print(Log.Level.Info, fmt, *args, **kwargs)
+
+    @staticmethod
+    def verb(fmt, *args, **kwargs):
+        Log.print(Log.Level.Verb, fmt, *args, **kwargs)
+
+    @staticmethod
+    def debug(fmt, *args, **kwargs):
+        Log.print(Log.Level.Debug, fmt, *args, **kwargs)
+
+
+
+###############################################################################
+# zeroconf (optional dependency)
+###############################################################################
+
+try:
+    from queue import Queue, Empty as QEmpty
+    from zeroconf import ServiceBrowser, Zeroconf, ServiceStateChange
+
+    def mdns_info_get(info):
+        addresses = ["%s:%d" % (socket.inet_ntoa(addr), int(info.port)) for addr in info.addresses]
+        addresses = ", ".join(addresses)
+        props = { k.decode("ascii"): v.decode("ascii") for k, v in info.properties.items() }
+        return addresses, props
+
+    def mdns_info_tostr(info):
+        addresses, props = mdns_info_get(info)
+        i = "  " # indent
+        props_str = ""
+        for k, v in props.items():
+            props_str += "{}={} ".format(k, v, i=i)
+
+        return """\
+    {i}Address: {addresses}
+    {i}Server:  {info.server}
+    {i}Props:   {props_str}\
+    """.format(**locals())
+
+
+    class ZeroConfHandler(object):
+        """
+        # Using https://pypi.org/project/zeroconf
+        # See also https://www.bountysource.com/teams/python-zeroconf/issues?tracker_ids=3879630
+
+        """
+        def __init__(self, service=MDNS_SERVICE):
+            self.events = Queue()
+            if service.endswith('._tcp') or service.endswith('._udp'):
+                service += ".local."
+            self._mdsn_service = service
+
+            self.zeroconf = Zeroconf()
+            self.browser = ServiceBrowser(self.zeroconf, service, handlers=[self.on_event])
+
+        def close(self):
+            # Do NOT close: it takes 5 seconds (sic!)
+            pass
+            #self.zeroconf.close()
+
+        def on_event(self, zeroconf: Zeroconf, service_type: str,
+                     name: str, state_change: ServiceStateChange) -> None:
+            event = (name, state_change)
+            self.events.put(event)
+
+        def get_service_info(self, mdns_type: str, name: str, timeout=None):
+            started = time.time()
+            info = self.zeroconf.get_service_info(mdns_type, name, timeout=int(1000 * timeout))
+            Log.info("mDNS get_service_info() elapsed = {:.3f}s", time.time() - started)
+            return info
+
+    def zeroconf_search(searchfor=None, num=None, timeout=3):
+        """
+
+        :param searchfor:
+        :param timeout:
+        :param num:       Stop when `num` instances have been found
+        :return:
+        """
+        Log.info("Waiting {:.1f}s for zeroconf events (searchfor={})...",
+                 timeout, "ALL" if searchfor is None else searchfor)
+
+        zeroconf = ZeroConfHandler()
+        started = time.time()
+        last_at = None
+        deadline = started + timeout
+
+        found = []
+        while time.time() < deadline:
+            rem_time = deadline - time.time()
+            try:
+                ev = zeroconf.events.get(timeout=rem_time)
+            except QEmpty:
+                continue
+
+            name, ev_type = ev
+            if ev_type is ServiceStateChange.Added:
+                info = zeroconf.zeroconf.get_service_info(MDNS_SERVICE, name)
+                addresses, props = mdns_info_get(info)
+                props = [ p for p in props.values()] + [ info.server ]
+                all_props = " ".join(props)
+
+                if searchfor is None or searchfor in all_props:
+                    if Log.verbose >= Log.Level.Verb:
+                        Log.verb("Found @ {:.1f}s: {}".format(time.time() - started, name))
+                    else:
+                        print("Found {}".format(name))
+
+                    info_str = mdns_info_tostr(info)
+                    print(info_str)
+                    mdns_ipaddr = socket.inet_ntoa(info.addresses[0])
+
+                    found.append((info.server, mdns_ipaddr))
+                    last_at = time.time()
+                    if num and len(found) >= num:
+                        break
+
+                continue
+
+            print("Found @ {:.1f}s: {}, {}".format(time.time() - started, ev_type, name))
+
+            if ev_type is ServiceStateChange.Removed:
+                Log.verb("Zeroconf Removed: name = {}", name)
+            elif ev_type is ServiceStateChange.Updated:
+                Log.verb("Zeroconf Updated: name = {}", name)
+            else:
+                Log.verb("Zeroconf OOPS EVENT: name = {}", name)
+
+        Log.info("mDNS discovery took {:.1f}s (last result after {:.1f}s), found = \n{}",
+                 time.time() - started, last_at - started, "\n".join([str(f) for f in found]))
+
+        return found
+except ImportError:
+    pass
+
+
+################################################################################
+#
+################################################################################
+
+class TcpInstrument(object):
+    """
+    TCP client that uses ASCII protocol with '\n' as message terminator
+    """
+    def __init__(self, family=socket.AF_INET):
+        self.family = family
+        self.sock = None
+
+        self.time_for_queries = 0
+
+    def connect(self, host, port, flags=0):
+        #Log.verb("TCP connecting to {}:{}", host, port)
+        for res in socket.getaddrinfo(host, port, self.family, socket.SOCK_STREAM,
+                                      flags=flags|socket.AI_CANONNAME):
+            af, socktype, proto, canonname, sa = res
+            try:
+                self.sock = socket.socket(af, socktype, proto)
+                self.sock.connect(sa)
+                self.sock.settimeout(1)
+                Log.verb("TCP connected to {} port {} timeout={}s", host, port, self.sock.gettimeout())
+                return
+            except OSError as e:
+                self.sock.close()
+                self.sock = None
+                continue
+
+        raise RuntimeError("TCP connection to {} port {} failed".format(host, port))
+
+
+    def close(self):
+        self.sock.close()
+
+    def write(self, s):
+        Log.info("send: {}", s)
+        self.sock.send(s.encode('ascii') + b"\n")
+
+    def read(self, timeout=None):
+        if timeout:
+            tout_saved = self.sock.gettimeout()
+            self.sock.settimeout(timeout)
+        try:
+            data = self.sock.recv(1024)
+            text = data.decode('ascii').strip()
+            Log.info("recv: {}", text)
+            return text
+        finally:
+            if timeout:
+                self.sock.settimeout(tout_saved)
+
+    def query(self, s):
+        started = time.time()
+        self.write(s)
+        r = self.read()
+        elapsed = time.time() - started
+        self.time_for_queries += elapsed
+        return r
+
+    def opc_wait(self, timeout=1):
+        deadline = time.time() + timeout
+        while True:
+            try:
+                self.query("*OPC?")
+                break
+            except socket.timeout:
+                if time.time() >= deadline:
+                    raise TimeoutError("*OPC? TIMEOUT after {:.1f}s".format(timeout))
+                # hmm, what to do?
+                time.sleep(0.25)
+
+
+################################################################################
+#
+################################################################################
+
+class RohdeSchwarzHMC8043(TcpInstrument):
+    """
+    R&S®HMC804x Power Supply SCPI Programmers Manual
+      https://www.rohde-schwarz.com/us/manual/r-s-hmc804x-power-supply-scpi-programmers-manual-manuals-gb1_78701-172161.html
+
+    R&S®HMC804x Power Supply User Manual
+      https://www.rohde-schwarz.com/lv/manual/r-s-hmc804x-power-supply-user-manual-manuals-gb1_78701-78982.html
+      https://scdn.rohde-schwarz.com/ur/pws/dl_downloads/dl_common_library/dl_manuals/gb_1/h/hmc804x/HMC804x_UserManual_de_en_04.pdf
+
+    """
+    TCP_PORT = 5025
+
+    def __init__(self, host, port=5025):
+        super().__init__()
+
+        Log.verb("Opening {} @ {}:{}".format(self.__class__.__name__, host, port))
+        self.connect(host, port)
+
+        self._selected_output = None
+        self.id = None
+        self._num_chans = None
+
+    def __str__(self):
+        return "<{}@{}>".format(self.__class__.__name__, self.sock.getpeername()[0])
+
+    def connect(self, *args, **kwargs):
+        super().connect(*args, **kwargs)
+        # Work-around for HM804x bug where a pending response to the previously
+        # connected client is just sent to the next connecting client.
+        # Thus we have to start with a flush.
+        try:
+            r = self.read(timeout=0.01)
+            if r:
+                print("Flushed HMC804x transmit buffer:", repr(r))
+        except socket.timeout:
+            pass
+
+    def _ask_bool(self, cmd):
+        r = self.query(cmd)
+        if r == "0":
+            return False
+        elif r == "1":
+            return True
+        raise ValueError("{} '{}' returned '{}' but expected '0' or '1'".format(self, cmd, r))
+
+    @property
+    def num_chans(self):
+        if not self.id:
+            self.query_idn()
+        return self._num_chans
+
+    def query_idn(self):
+        # Rohde&Schwarz,HMC8043,034889436,HW42000000,SW01.400
+        self.id = self.query("*IDN?")
+        parts = self.id.split(",")
+        if parts[1].startswith("HMC804"):
+            self._num_chans = int(parts[1][-1])
+            Log.verb("{} has {} outputs/channels", parts[1], self._num_chans)
+        else:
+            raise EnvironmentError("Not a HMC804x instrument? IDN = {}".format(self.query_idn))
+        return self.id
+
+    def send_cls(self):
+        self.query("*CLS")
+
+    def _assert_chan_current(self, value):
+        current_max_per_type = [ 10, 5, 3 ]
+        cur_max = current_max_per_type[self.num_chans - 1]
+        if value > cur_max:
+            raise ValueError("Max current for HMC804{} is {}A (tried {:.1f}A)".format(
+                self.num_chans, cur_max, value))
+
+    def query_system_error(self):
+        """
+        Responds with `0,"No error"` if there is no error
+
+        :return: errcode, message
+        """
+        cmd = "SYSTem:ERRor?"
+        r = self.query(cmd)
+        parts = r.split(",")
+        if len(parts) != 2:
+            raise RuntimeError("Got odd response from {}: {}".format(repr(cmd), repr(r)))
+        errcode, msg = parts
+        msg = msg.strip('"')
+        return int(errcode), msg
+
+    def assert_no_system_error(self):
+        err, msg = self.query_system_error()
+        if err == 0:
+            return
+        errmsg = '{} returned error: {},"{}"'.format(self, err, msg)
+        raise RuntimeError(errmsg)
+
+
+    def select_output(self, index):
+        index = int(index)
+        if not (1 <= index <= self.num_chans):
+            raise ValueError("index must be in range [1..{}]".format(self.num_chans))
+        if self._selected_output != index:
+            self.write("INST OUT{}".format(index))
+            self._selected_output = index
+
+    def set_voltage(self, index, value):
+        self.select_output(index)
+        cmd = "VOLT {:f}".format(value)
+        self.write(cmd)
+        self.assert_no_system_error()
+
+    def get_voltage(self, index):
+        self.select_output(index)
+        return float(self.query("VOLT?"))
+
+    def set_current(self, index, value):
+        self._assert_chan_current(value)
+        self.select_output(index)
+        cmd = "CURR {:f}".format(value)
+        self.write(cmd)
+        self.assert_no_system_error()
+
+    def get_current(self, index):
+        self.select_output(index)
+        return float(self.query("CURRent?"))
+
+    def output_enable(self, index, ena):
+        """Enable/disable OUTPUT channel, do NOT change MASTER enable"""
+        self.select_output(index)
+        onoff = "ON" if ena else "OFF"
+        cmd = "OUTPut:CHAN {}".format(onoff)
+        self.write(cmd)
+
+    def is_output_enabled(self, index):
+        self.select_output(index)
+        return self._ask_bool("OUTPut:CHAN?")
+
+    def master_output_enable(self, ena):
+        onoff = "ON" if ena else "OFF"
+        cmd = "OUTPUT:MASTER {}".format(onoff)
+        self.write(cmd)
+
+    def is_master_output_enabled(self):
+        return self._ask_bool("OUTPUT:MASTER?")
+
+    def meas_current(self, index):
+        self.select_output(index)
+        r = self.query("MEASure:CURRent?")
+        if not r:
+            Log.verb("MEASure:CURRent? response empty, retrying read")
+            r = self.read()
+            if not r:
+                raise ValueError("MEASure:CURRent? response empty twice!")
+        return float(r)
+
+    def meas_voltage(self, index):
+        self.select_output(index)
+        return float(self.query("MEASure:VOLT?"))
+
+    def print_status(self):
+        print("Master: {}".format("ON" if self.is_master_output_enabled() else "off"))
+        for i in range(1, self.num_chans + 1):
+            print("Chan {}: {} {:6.3f} V {:6.3f} A  CUR:{:6.3f} A".format(
+                i, "ON " if self.is_output_enabled(i) else "off",
+                self.get_voltage(i),
+                self.get_current(i),
+                self.meas_current(i),
+            ))
+
+################################################################################
+#
+################################################################################
+
+class CmdFuncProxy(object):
+    """
+    Class that more or less magically turns derived classes into commandline
+    classes, i.e. each method that starts with `cmd_` in the derived class
+    becomes a command that can be used on the commandline
+    """
+    def __init__(self, inst):
+        self.inst = inst
+
+    cmd_func_args_uppercase = True
+    cmd_func_prefix = "cmd_"
+
+    _commands = {}
+
+    @classmethod
+    def get_commands(cls):
+        """
+        Cache all command functions in this class, sorted by lineno.
+        The `self.commands` dict will contain all the functions.
+
+        :return:
+        """
+        if not cls._commands:
+            funcs = []
+            for name in dir(cls):
+                obj = getattr(cls, name)
+                if not callable(obj):
+                    continue
+                if not obj.__name__.startswith(cls.cmd_func_prefix):
+                    continue
+
+                funcs.append((obj.__code__.co_firstlineno, obj))
+
+            prefix_len = len(cls.cmd_func_prefix)
+            # Make dict of all commands, sorted by lineno
+            cls._commands = {
+                func.__name__[prefix_len:]: func for lineno, func in sorted(funcs) }
+
+        return cls._commands
+
+
+    @classmethod
+    def iter_syntax_docstr0(cls):
+        """
+        Iterator that returning (syntax, docstring[0]) for each command
+
+        :return:  cmd_syntax, [ params ], cmd_docstr
+        """
+        for cmd, func in cls.get_commands().items():
+            sig = inspect.signature(func)
+            param_names = list(sig.parameters.keys())[1:] # skip `self` param
+
+            syntax = cmd
+            params_ltge = [ cmd ]
+            if len(param_names):
+                for param_name in param_names:
+                    syntax_param_name = param_name.upper() if cls.cmd_func_args_uppercase else param_name
+
+                    param = sig.parameters[param_name]
+                    if param.default is not inspect.Parameter.empty:
+                        syntax_param_name += "=" + str(param.default)
+                    params_ltge.append("<{}>".format(syntax_param_name))
+                syntax += "=" + ",".join(params_ltge[1:])
+
+            docstr0 = inspect.getdoc(func)
+            if docstr0:
+                docstr0 = docstr0.splitlines()[0]
+
+            yield syntax, params_ltge, docstr0
+
+    def lookup_cmd_by_name(self, name):
+        found = []
+        for cmd in self.__class__.get_commands():
+            if cmd.startswith(name):
+                found.append(cmd)
+        if len(found) == 1:
+            return found[0]
+        if len(found) > 1:
+            raise ValueError("Ambiguous command: '{}' matches '{}'".format(name, "', '".join(found)))
+        if not found:
+            raise ValueError("Unknown command: '{}'".format(name))
+
+    def execute(self, cmds):
+        for cmd in cmds:
+            m = re.match("([a-z_]+)(.*)", cmd)
+            if not m:
+                raise ValueError("Unknown command: {}".format(cmd))
+
+            name = m.group(1)
+            allargs = m.group(2)
+
+            name = self.lookup_cmd_by_name(name)
+
+            func = self.__class__.get_commands()[name]
+            sig = inspect.signature(func)
+            params = sig.parameters
+            param_names = list(params.keys())[1:] # skip 'self' param
+
+            num_params_required = 0
+            for param_name, param in params.items():
+                if param_name == 'self':
+                    continue
+                param = params[param_name]
+                if param.default is inspect.Parameter.empty:
+                    num_params_required += 1
+
+            call_args = {}
+            args = []
+            if allargs:
+                args = re.split("=|,|:", allargs)
+                if not args[0]:
+                    del args[0]
+
+            if len(args) < num_params_required:
+                if num_params_required == len(param_names):
+                    raise ValueError("Expected {} param(s) for '{}' but got {}: {}".format(
+                        len(param_names), name, len(args), args))
+                else:
+                    raise ValueError("Expected min {}, max {} param(s) for '{}' but got {}: {}".format(
+                        num_params_required, len(param_names), name, len(args), args))
+            if len(args) > len(param_names):
+                raise ValueError("Expected max {} param(s) for '{}' but got {}: {}".format(
+                        len(param_names), name, len(args), args))
+
+            # Prepare argument dictionary for the method call
+            for i, arg in enumerate(args):
+                param_name = param_names[i]
+                if arg:
+                    numerical_arg = float(arg)
+                    call_args[param_name] = numerical_arg
+
+            func(self, **call_args)
+
+
+################################################################################
+# PSU Command/Func Proxy
+################################################################################
+
+class PSUCmdFuncProxy(CmdFuncProxy):
+    """
+    When you add new functions to this class they will automatically turn
+    into commands for the commandline (it can hardly be much easier).
+    """
+    cmd_func_prefix = "cmd_"
+    cmd_func_args_uppercase = True
+
+    @classmethod
+    def iter_syntax_docstr0(cls):
+        """Modify the syntax slightly"""
+        for syntax, params, docstr in super(PSUCmdFuncProxy, cls).iter_syntax_docstr0():
+            if len(params) >= 2 and params[1] == "<CHAN>":
+                syntax_mod = "".join(params[:2])
+                if len(params) >= 3:
+                    syntax_mod += "=" + ",".join(params[2:])
+            else:
+                syntax_mod = syntax
+
+            yield syntax_mod, docstr
+
+    @staticmethod
+    def print_examples():
+        print("""\
+Set voltage and current of output 1, then show status:
+  {prog}  v1=4.1  i1=3  sta
+Toggle output 3 off, then on (0.5s delay by default):
+  {prog}  tog3
+Toggle output 3 off, then on but with 2s delay
+  {prog}  off3 wait=2 on3
+Show current output of channel 2 
+  {prog}  mi2
+Measure current of channel 2, report if change is > 3%, 100 reports 
+  {prog}  mi2=100,3\
+""".format(prog=os.path.basename(__file__)))
+
+    def cmd_on(self, chan):
+        """Output channel ON"""
+        self.inst.output_enable(chan, 1)
+
+    def cmd_off(self, chan):
+        """Output channel OFF"""
+        self.inst.output_enable(chan, 0)
+
+    def cmd_toggle(self, chan):
+        """Toggle output channel OFF, sleep 0.5s, then ON"""
+        self.inst.output_enable(chan, 0)
+        self.cmd_wait(0.5)
+        self.inst.output_enable(chan, 1)
+
+    def cmd_v(self, chan, VOLTAGE):
+        """Set output voltage"""
+        self.inst.set_voltage(chan, VOLTAGE)
+
+    def cmd_i(self, chan, CURRENT):
+        """Set output maximum current"""
+        self.inst.set_current(chan, CURRENT)
+
+    def cmd_master(self, ENABLE):
+        """Master ON/OFF"""
+        self.inst.master_output_enable(ENABLE)
+
+    def cmd_wait(self, SECONDS):
+        """Sleep SECONDS"""
+        Log.info("wait: {:.1f}s", SECONDS)
+        time.sleep(SECONDS)
+
+    def cmd_status(self):
+        """Print instrument status for all outputs"""
+        self.inst.print_status()
+
+    def cmd_mi(self, chan, num=None, d_pct=3, secs=9999, freq=10):
+        """Measure output current for some time or number of reports
+
+        :param chan:  Output channel
+        :param num:   Number of measurements to report
+        :param d_pct: Minimum percentual change before reporting measurement
+        :param secs:  Number of seconds to measure
+        :param freq:  Frequency of measurements
+        :return:
+        """
+        num_done = 0
+
+        def print_meas():
+            dt = now - time_last
+            ts_ms = int(1000 * (now - (int(now))))
+            ts = "{:s}.{:03d}".format(time.strftime("%H:%M:%S"), ts_ms)
+            print("{}  {:6.3f}s  {:5.0f} {:+5.0f}  {:3.0f}%".format(
+                ts, dt, 1000 * cur, 1000 * cur_d, cur_d_pct))
+
+        msg = ""
+        if d_pct > 0:
+            msg += "report if change > {:.0f}%, ".format(d_pct)
+        if num and num >= 2:
+            msg += "{:.0f} reports".format(num)
+            Log.note("Measuring current for {}s, {}".format(secs, msg))
+            print("Time               dt   I/mA dI/mA d/pct")
+
+        now = time.monotonic()
+        time_last = now
+        cur = self.inst.meas_current(chan)
+        cur_last = cur
+        cur_d, cur_d_pct = 0, 0
+        print_meas()
+        num_done += 1
+
+        deadline = time_last + secs
+        while num is not None and num_done < num:
+            now = time.monotonic()
+            if now > deadline:
+                break
+
+            cur = self.inst.meas_current(chan)
+            cur_d = cur - cur_last
+
+            cur_d_pct = (cur / cur_last - 1) * 100 if cur_last else 100
+            if cur_d != 0 and abs(cur_d_pct) >= d_pct:
+                print_meas()
+                num_done += 1
+                cur_last = cur
+                time_last = now
+
+            time.sleep(1/freq)
+
+
+################################################################################
+# Main And Argument Parsing
+################################################################################
+
+def parser_create():
+    description = """Remote control of Rohde & Schwarz HM804x PSU (over TCP/IP)
+"""
+
+    cmds = [ (syntax, doc) for syntax, doc in PSUCmdFuncProxy.iter_syntax_docstr0() ]
+    width_max = max([len(syntax) for syntax, doc in cmds])
+
+    cmd_syntaxes = "Commands:\n"
+    for syntax, doc in cmds:
+        #cmd_syntaxes += "  {:{}s}\n    {}\n".format(syntax, width_max, doc)
+        cmd_syntaxes += "  {}\n    {}\n".format(syntax, doc)
+    cmd_syntaxes += "\nCommands can be abbreviated"
+
+    parser = argparse.ArgumentParser(formatter_class=argparse.RawTextHelpFormatter,
+        description=description, epilog=cmd_syntaxes, add_help=False)
+
+    parser.add_argument(dest='cmds', metavar='CMD', type=str, nargs='*',
+        help="One or more commands to execute")
+
+    parser.add_argument('-c', dest='hostandport', metavar="HOST", default=HOSTNAME_DEFAULT,
+        help="Host (and port) to connect to. Default is " + HOSTNAME_DEFAULT)
+    parser.add_argument('-s', dest='status', action='store_true', default=False,
+        help="Show current status")
+
+    if 'zeroconf' not in sys.modules:
+        zero_help = "You need to install Python zeroconf before this works"
+    else:
+        zero_help = "You seem to have Python zeroconf installed, good"
+    parser.add_argument('-l', metavar="NAME", dest='zeroconf', type=str,
+        nargs='?', const=MDNS_SEARCHFOR_NAME,
+        help="""List {} instruments on LAN (using zeroconf {} service name)
+If NAME is given then search for that name in mDNS TXT record
+(e.g. 'HMC' or the instrument's serial number)
+-ll will list all LXI instruments
+{}""".format(MDNS_SEARCHFOR_NAME, MDNS_SERVICE, zero_help))
+
+    parser.add_argument('-v', dest='verbose', action='count', default=0,
+        help="Be more verbose. Can be given twice")
+    parser.add_argument('-d', dest='debug', action='store_true', default=False,
+        help="Show full exception traces on errors")
+    parser.add_argument('-h', dest='help', action='count',
+        help="Show this help message and exit. Twice to see examples!")
+
+    return parser
+
+def main():
+    try:
+        if opt.zeroconf:
+            if not 'zeroconf' in sys.modules:
+                raise RuntimeError("You need to install Python zeroconf")
+            searchfor = opt.zeroconf if opt.zeroconf != "l" else ""
+            num = None
+            if "," in searchfor:
+                parts = searchfor.split(",")
+                if not (len(parts) == 2 and str.isdigit(parts[0][0])):
+                    raise RuntimeError(
+                        "mDNS search NAME format is: [NUM,]NAME where NUM is the number of instances to stop at")
+                num, searchfor = int(parts[0]), parts[1]
+            zeroconf_search(searchfor, num=num, timeout=3)
+            sys.exit(0)
+
+        if ":" in opt.hostandport:
+            ipaddr, port = opt.hostandport.split(":")
+        else:
+            ipaddr, port = opt.hostandport, PORT_DEFAULT
+
+        psu = RohdeSchwarzHMC8043(ipaddr)
+
+        if opt.cmds and not opt.status:
+            psu_cmdline = PSUCmdFuncProxy(psu)
+            psu_cmdline.execute(opt.cmds)
+        else:
+            psu.print_status()
+        Log.info("{:.0f}ms".format(psu.time_for_queries * 1000))
+    except (ValueError, EnvironmentError, RuntimeError) as e:
+        if opt.debug:
+            raise
+        sys.stderr.write("ERROR: {}\n".format(e))
+        sys.stderr.write("Tip: run with -d option to see full stack trace\n")
+        sys.exit(1)
+
+if __name__ == "__main__":
+    parser = parser_create()
+    opt = parser.parse_args()
+    if opt.help:
+        if opt.help == 1:
+            parser.print_help()
+            print("(Python {})".format(sys.version.split()[0]))
+        elif opt.help == 2:
+            PSUCmdFuncProxy.print_examples()
+        sys.exit(0)
+    Log.verbose = opt.verbose
+    main()
