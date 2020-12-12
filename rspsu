@@ -16,10 +16,10 @@ PORT_DEFAULT=5025
 HOSTNAME_DEFAULT = "192.168.2.21:{}".format(PORT_DEFAULT)
 
 # Default instrument type to search for with -l option
-MDNS_SEARCHFOR_NAME = "HMC804"
+MDNS_SEARCHFOR_DEFAULT = "HMC804"
 
 # mDNS service type to search for with -l option
-MDNS_SERVICE = "_lxi._tcp.local."
+MDNS_SERVICE = "_lxi._tcp"
 
 
 ################################################################################
@@ -87,7 +87,8 @@ try:
     def mdns_info_get(info):
         addresses = ["%s:%d" % (socket.inet_ntoa(addr), int(info.port)) for addr in info.addresses]
         addresses = ", ".join(addresses)
-        props = { k.decode("ascii"): v.decode("ascii") for k, v in info.properties.items() }
+        props = { k.decode("ascii", errors="ignore"): v.decode("ascii", errors="ignore")
+                  for k, v in info.properties.items() }
         return addresses, props
 
     def mdns_info_tostr(info):
@@ -103,6 +104,29 @@ try:
     {i}Props:   {props_str}\
     """.format(**locals())
 
+    def string_to_service(s):
+        """
+        Convert simple service string to correct Zeroconf service string, e.g.
+
+          lxi.tcp -> _lxi._tcp.local.
+
+        :param s:  simple service name, e.g. "http", "ftp, "lxi", "ipp", etc.
+                   optionally suffixed by ".tcp" or ".udp"
+        :return:   f"_{s}._tcp.local." or f"_{s}._udp.local."
+        """
+        p = s.split(".")
+        # remove the underscores (for easier processing)
+        p = [ x.lstrip("_") for x in p ]
+        proto = "tcp"
+        if len(p) == 2:
+            if p[-1] not in ('tcp', 'udp'):
+                raise ValueError("Zeroconf service must end with '.tcp' or '.udp'")
+            proto = p[-1]
+        elif len(p) != 1:
+            raise ValueError("Zeroconf service must start with 'SOMENAME.tcp.' or 'SOMENAME.udp'")
+        s = "_{p[0]}._{proto}.local.".format(**locals())
+        return s
+
 
     class ZeroConfHandler(object):
         """
@@ -112,12 +136,10 @@ try:
         """
         def __init__(self, service=MDNS_SERVICE):
             self.events = Queue()
-            if service.endswith('._tcp') or service.endswith('._udp'):
-                service += ".local."
-            self._mdsn_service = service
-
+            self.service = string_to_service(service)
             self.zeroconf = Zeroconf()
-            self.browser = ServiceBrowser(self.zeroconf, service, handlers=[self.on_event])
+            Log.info("browsing for service: {}", self.service)
+            self.browser = ServiceBrowser(self.zeroconf, self.service, handlers=[self.on_event])
 
         def close(self):
             # Do NOT close: it takes 5 seconds (sic!)
@@ -148,7 +170,7 @@ try:
 
         zeroconf = ZeroConfHandler()
         started = time.time()
-        last_at = None
+        last_at = started
         deadline = started + timeout
 
         found = []
@@ -161,7 +183,7 @@ try:
 
             name, ev_type = ev
             if ev_type is ServiceStateChange.Added:
-                info = zeroconf.zeroconf.get_service_info(MDNS_SERVICE, name)
+                info = zeroconf.zeroconf.get_service_info(zeroconf.service, name)
                 addresses, props = mdns_info_get(info)
                 props = [ p for p in props.values()] + [ info.server ]
                 all_props = " ".join(props)
@@ -198,6 +220,33 @@ try:
         return found
 except ImportError:
     pass
+
+def zeroconf_add_argument(parser):
+    if 'zeroconf' not in sys.modules:
+        zero_help = "You need to install Python zeroconf before this works"
+    else:
+        zero_help = "You seem to have Python zeroconf installed, good"
+    parser.add_argument('-l', metavar="STR", dest='zeroconf', type=str,
+        nargs='?', const=MDNS_SEARCHFOR_DEFAULT,
+        help="""Scan for instruments on LAN (using zeroconf {} service name)
+If STR is given then search for that STR in mDNS TXT record
+e.g. 'HMC' or the instrument's serial number
+Default search STR is '{}'.
+-ll will list all LXI instruments (empty search/filter string)
+{}""".format(MDNS_SERVICE, MDNS_SEARCHFOR_DEFAULT, zero_help))
+
+def zeroconf_scan(arg):
+    if not 'zeroconf' in sys.modules:
+        raise RuntimeError("You need to install Python zeroconf")
+    searchfor = arg if arg != "l" else ""
+    num = None
+    if "," in searchfor:
+        parts = searchfor.split(",")
+        if not (len(parts) == 2 and str.isdigit(parts[0][0])):
+            raise RuntimeError(
+                "mDNS search NAME format is: [NUM,]NAME where NUM is the number of instances to stop at")
+        num, searchfor = int(parts[0]), parts[1]
+    zeroconf_search(searchfor, num=num, timeout=3)
 
 
 ################################################################################
@@ -740,17 +789,7 @@ def parser_create():
     parser.add_argument('-s', dest='status', action='store_true', default=False,
         help="Show current status")
 
-    if 'zeroconf' not in sys.modules:
-        zero_help = "You need to install Python zeroconf before this works"
-    else:
-        zero_help = "You seem to have Python zeroconf installed, good"
-    parser.add_argument('-l', metavar="NAME", dest='zeroconf', type=str,
-        nargs='?', const=MDNS_SEARCHFOR_NAME,
-        help="""List {} instruments on LAN (using zeroconf {} service name)
-If NAME is given then search for that name in mDNS TXT record
-(e.g. 'HMC' or the instrument's serial number)
--ll will list all LXI instruments
-{}""".format(MDNS_SEARCHFOR_NAME, MDNS_SERVICE, zero_help))
+    zeroconf_add_argument(parser)
 
     parser.add_argument('-v', dest='verbose', action='count', default=0,
         help="Be more verbose. Can be given twice")
@@ -764,17 +803,7 @@ If NAME is given then search for that name in mDNS TXT record
 def main():
     try:
         if opt.zeroconf:
-            if not 'zeroconf' in sys.modules:
-                raise RuntimeError("You need to install Python zeroconf")
-            searchfor = opt.zeroconf if opt.zeroconf != "l" else ""
-            num = None
-            if "," in searchfor:
-                parts = searchfor.split(",")
-                if not (len(parts) == 2 and str.isdigit(parts[0][0])):
-                    raise RuntimeError(
-                        "mDNS search NAME format is: [NUM,]NAME where NUM is the number of instances to stop at")
-                num, searchfor = int(parts[0]), parts[1]
-            zeroconf_search(searchfor, num=num, timeout=3)
+            zeroconf_scan(opt.zeroconf)
             sys.exit(0)
 
         if ":" in opt.hostandport:
