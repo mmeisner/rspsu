@@ -15,6 +15,8 @@ from pprint import pprint
 PORT_DEFAULT=5025
 HOSTNAME_DEFAULT = "192.168.2.21:{}".format(PORT_DEFAULT)
 
+CMD_DEFAULT = "status"
+
 # Default instrument type to search for with -l option
 MDNS_SEARCHFOR_DEFAULT = "HMC804"
 
@@ -775,13 +777,13 @@ def parser_create():
     cmd_syntaxes = "Commands:\n"
     for syntax, doc in cmds:
         #cmd_syntaxes += "  {:{}s}\n    {}\n".format(syntax, width_max, doc)
-        cmd_syntaxes += "  {}\n    {}\n".format(syntax, doc)
-    cmd_syntaxes += "\nCommands can be abbreviated"
+        cmd_syntaxes += "  {}\n      {}\n".format(syntax, doc)
+    cmd_syntaxes += "\nCommands can be abbreviated. Default command is: {}".format(CMD_DEFAULT)
 
     parser = argparse.ArgumentParser(formatter_class=argparse.RawTextHelpFormatter,
         description=description, epilog=cmd_syntaxes, add_help=False)
 
-    parser.add_argument(dest='cmds', metavar='CMD', type=str, nargs='*',
+    parser.add_argument(dest='cmds', metavar='CMD', type=str, nargs='*', default=[CMD_DEFAULT],
         help="One or more commands to execute")
 
     parser.add_argument('-c', dest='hostandport', metavar="HOST", default=HOSTNAME_DEFAULT,
@@ -810,12 +812,9 @@ def main():
             ipaddr, port = opt.hostandport, PORT_DEFAULT
 
         psu = RohdeSchwarzHMC8043(ipaddr)
+        psu_cmdline = PSUCmdFuncProxy(psu)
+        psu_cmdline.execute(opt.cmds)
 
-        if opt.cmds and not opt.status:
-            psu_cmdline = PSUCmdFuncProxy(psu)
-            psu_cmdline.execute(opt.cmds)
-        else:
-            psu.print_status()
         Log.info("{:.0f}ms".format(psu.time_for_queries * 1000))
     except (ValueError, EnvironmentError, RuntimeError) as e:
         if opt.debug:
@@ -834,5 +833,6 @@ if __name__ == "__main__":
         elif opt.help == 2:
             PSUCmdFuncProxy.print_examples()
         sys.exit(0)
+
     Log.verbose = opt.verbose
     main()
