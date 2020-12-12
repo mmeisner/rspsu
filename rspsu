@@ -786,13 +786,11 @@ def parser_create():
 
     parser.add_argument('-c', dest='hostandport', metavar="HOST", default=HOSTNAME_DEFAULT,
         help="Host (and port) to connect to. Default is " + HOSTNAME_DEFAULT)
-    parser.add_argument('-s', dest='status', action='store_true', default=False,
-        help="Show current status")
 
     zeroconf_add_argument(parser)
 
     parser.add_argument('-v', dest='verbose', action='count', default=0,
-        help="Be more verbose. Can be given twice")
+        help="Be more verbose")
     parser.add_argument('-d', dest='debug', action='store_true', default=False,
         help="Show full exception traces on errors")
     parser.add_argument('-h', dest='help', action='count',
