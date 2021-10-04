@@ -13,7 +13,7 @@ import inspect
 from pprint import pprint
 
 PORT_DEFAULT=5025
-HOSTNAME_DEFAULT = "192.168.2.21:{}".format(PORT_DEFAULT)
+HOSTNAME_DEFAULT = f"192.168.2.21:{PORT_DEFAULT}"
 
 CMD_DEFAULT = "status"
 
@@ -98,13 +98,13 @@ try:
         i = "  " # indent
         props_str = ""
         for k, v in props.items():
-            props_str += "{}={} ".format(k, v, i=i)
+            props_str += f"{k}={v} "
 
-        return """\
+        return f"""\
     {i}Address: {addresses}
     {i}Server:  {info.server}
     {i}Props:   {props_str}\
-    """.format(**locals())
+    """
 
     def string_to_service(s):
         """
@@ -126,7 +126,7 @@ try:
             proto = p[-1]
         elif len(p) != 1:
             raise ValueError("Zeroconf service must start with 'SOMENAME.tcp.' or 'SOMENAME.udp'")
-        s = "_{p[0]}._{proto}.local.".format(**locals())
+        s = f"_{p[0]}._{proto}.local."
         return s
 
 
@@ -156,7 +156,7 @@ try:
         def get_service_info(self, mdns_type: str, name: str, timeout=None):
             started = time.time()
             info = self.zeroconf.get_service_info(mdns_type, name, timeout=int(1000 * timeout))
-            Log.info("mDNS get_service_info() elapsed = {:.3f}s", time.time() - started)
+            Log.info(f"mDNS get_service_info() elapsed = {time.time() - started:.3f}s")
             return info
 
     def zeroconf_search(searchfor=None, num=None, timeout=3):
@@ -167,8 +167,9 @@ try:
         :param num:       Stop when `num` instances have been found
         :return:
         """
-        Log.info("Waiting {:.1f}s for zeroconf events (searchfor={})...",
-                 timeout, "ALL" if searchfor is None else searchfor)
+        print(searchfor)
+        s = "ALL" if not searchfor else searchfor
+        Log.info(f"Waiting {timeout:.1f}s for zeroconf events (searchfor={s})...")
 
         zeroconf = ZeroConfHandler()
         started = time.time()
@@ -192,9 +193,9 @@ try:
 
                 if searchfor is None or searchfor in all_props:
                     if Log.verbose >= Log.Level.Verb:
-                        Log.verb("Found @ {:.1f}s: {}".format(time.time() - started, name))
+                        Log.verb(f"Found @ {time.time() - started:.1f}s: {name}")
                     else:
-                        print("Found {}".format(name))
+                        print(f"Found {name}")
 
                     info_str = mdns_info_tostr(info)
                     print(info_str)
@@ -207,14 +208,15 @@ try:
 
                 continue
 
-            print("Found @ {:.1f}s: {}, {}".format(time.time() - started, ev_type, name))
+            elapsed = time.time() - started
+            print(f"Found @ {elapsed:.1f}s: {ev_type}, {name}")
 
             if ev_type is ServiceStateChange.Removed:
-                Log.verb("Zeroconf Removed: name = {}", name)
+                Log.verb(f"Zeroconf Removed: name = {name}")
             elif ev_type is ServiceStateChange.Updated:
-                Log.verb("Zeroconf Updated: name = {}", name)
+                Log.verb(f"Zeroconf Updated: name = {name}")
             else:
-                Log.verb("Zeroconf OOPS EVENT: name = {}", name)
+                Log.verb(f"Zeroconf OOPS EVENT: name = {name}")
 
         Log.info("mDNS discovery took {:.1f}s (last result after {:.1f}s), found = \n{}",
                  time.time() - started, last_at - started, "\n".join([str(f) for f in found]))
@@ -230,12 +232,12 @@ def zeroconf_add_argument(parser):
         zero_help = "You seem to have Python zeroconf installed, good"
     parser.add_argument('-l', metavar="STR", dest='zeroconf', type=str,
         nargs='?', const=MDNS_SEARCHFOR_DEFAULT,
-        help="""Scan for instruments on LAN (using zeroconf {} service name)
+        help=f"""Scan for instruments on LAN (using zeroconf {MDNS_SERVICE} service name)
 If STR is given then search for that STR in mDNS TXT record
 e.g. 'HMC' or the instrument's serial number
-Default search STR is '{}'.
+Default search STR is '{MDNS_SEARCHFOR_DEFAULT}'.
 -ll will list all LXI instruments (empty search/filter string)
-{}""".format(MDNS_SERVICE, MDNS_SEARCHFOR_DEFAULT, zero_help))
+{zero_help}""")
 
 def zeroconf_scan(arg):
     if not 'zeroconf' in sys.modules:
@@ -248,7 +250,9 @@ def zeroconf_scan(arg):
             raise RuntimeError(
                 "mDNS search NAME format is: [NUM,]NAME where NUM is the number of instances to stop at")
         num, searchfor = int(parts[0]), parts[1]
-    zeroconf_search(searchfor, num=num, timeout=3)
+
+    devices = zeroconf_search(searchfor, num=num, timeout=5)
+    Log.note(f"found {len(devices)} devices")
 
 
 ################################################################################
@@ -274,14 +278,14 @@ class TcpInstrument(object):
                 self.sock = socket.socket(af, socktype, proto)
                 self.sock.connect(sa)
                 self.sock.settimeout(1)
-                Log.verb("TCP connected to {} port {} timeout={}s", host, port, self.sock.gettimeout())
+                Log.verb(f"TCP connected to {host} port {port} timeout={self.sock.gettimeout()}s")
                 return
             except OSError as e:
                 self.sock.close()
                 self.sock = None
                 continue
 
-        raise RuntimeError("TCP connection to {} port {} failed".format(host, port))
+        raise RuntimeError(f"TCP connection to {host} port {port} failed")
 
 
     def close(self):
@@ -298,7 +302,7 @@ class TcpInstrument(object):
         try:
             data = self.sock.recv(1024)
             text = data.decode('ascii').strip()
-            Log.info("recv: {}", text)
+            Log.info(f"recv: {text}")
             return text
         finally:
             if timeout:
@@ -320,7 +324,7 @@ class TcpInstrument(object):
                 break
             except socket.timeout:
                 if time.time() >= deadline:
-                    raise TimeoutError("*OPC? TIMEOUT after {:.1f}s".format(timeout))
+                    raise TimeoutError(f"*OPC? TIMEOUT after {timeout:.1f}s")
                 # hmm, what to do?
                 time.sleep(0.25)
 
@@ -344,7 +348,7 @@ class RohdeSchwarzHMC8043(TcpInstrument):
     def __init__(self, host, port=5025):
         super().__init__()
 
-        Log.verb("Opening {} @ {}:{}".format(self.__class__.__name__, host, port))
+        Log.verb(f"Opening {self.__class__.__name__} @ {host}:{port}")
         self.connect(host, port)
 
         self._selected_output = None
@@ -352,7 +356,7 @@ class RohdeSchwarzHMC8043(TcpInstrument):
         self._num_chans = None
 
     def __str__(self):
-        return "<{}@{}>".format(self.__class__.__name__, self.sock.getpeername()[0])
+        return f"<{self.__class__.__name__}@{self.sock.getpeername()[0]}>"
 
     def connect(self, *args, **kwargs):
         super().connect(*args, **kwargs)
@@ -372,7 +376,7 @@ class RohdeSchwarzHMC8043(TcpInstrument):
             return False
         elif r == "1":
             return True
-        raise ValueError("{} '{}' returned '{}' but expected '0' or '1'".format(self, cmd, r))
+        raise ValueError(f"{self} '{cmd}' returned '{r}' but expected '0' or '1'")
 
     @property
     def num_chans(self):
@@ -386,9 +390,9 @@ class RohdeSchwarzHMC8043(TcpInstrument):
         parts = self.id.split(",")
         if parts[1].startswith("HMC804"):
             self._num_chans = int(parts[1][-1])
-            Log.verb("{} has {} outputs/channels", parts[1], self._num_chans)
+            Log.verb(f"{parts[1]} has {self._num_chans} outputs/channels")
         else:
-            raise EnvironmentError("Not a HMC804x instrument? IDN = {}".format(self.query_idn))
+            raise EnvironmentError(f"Not a HMC804x instrument? IDN = {self.query_idn}")
         return self.id
 
     def send_cls(self):
@@ -398,8 +402,7 @@ class RohdeSchwarzHMC8043(TcpInstrument):
         current_max_per_type = [ 10, 5, 3 ]
         cur_max = current_max_per_type[self.num_chans - 1]
         if value > cur_max:
-            raise ValueError("Max current for HMC804{} is {}A (tried {:.1f}A)".format(
-                self.num_chans, cur_max, value))
+            raise ValueError(f"Max current for HMC804{self.num_chans} is {cur_max}A (tried {value:.1f}A)")
 
     def query_system_error(self):
         """
@@ -411,7 +414,7 @@ class RohdeSchwarzHMC8043(TcpInstrument):
         r = self.query(cmd)
         parts = r.split(",")
         if len(parts) != 2:
-            raise RuntimeError("Got odd response from {}: {}".format(repr(cmd), repr(r)))
+            raise RuntimeError(f"Got odd response from {repr(cmd)}: {repr(r)}")
         errcode, msg = parts
         msg = msg.strip('"')
         return int(errcode), msg
@@ -420,21 +423,21 @@ class RohdeSchwarzHMC8043(TcpInstrument):
         err, msg = self.query_system_error()
         if err == 0:
             return
-        errmsg = '{} returned error: {},"{}"'.format(self, err, msg)
+        errmsg = f'{self} returned error: {err},"{msg}"'
         raise RuntimeError(errmsg)
 
 
     def select_output(self, index):
         index = int(index)
         if not (1 <= index <= self.num_chans):
-            raise ValueError("index must be in range [1..{}]".format(self.num_chans))
+            raise ValueError(f"index must be in range [1..{self.num_chans}]")
         if self._selected_output != index:
-            self.write("INST OUT{}".format(index))
+            self.write(f"INST OUT{index}")
             self._selected_output = index
 
     def set_voltage(self, index, value):
         self.select_output(index)
-        cmd = "VOLT {:f}".format(value)
+        cmd = f"VOLT {value:f}"
         self.write(cmd)
         self.assert_no_system_error()
 
@@ -445,7 +448,7 @@ class RohdeSchwarzHMC8043(TcpInstrument):
     def set_current(self, index, value):
         self._assert_chan_current(value)
         self.select_output(index)
-        cmd = "CURR {:f}".format(value)
+        cmd = f"CURR {value:f}"
         self.write(cmd)
         self.assert_no_system_error()
 
@@ -457,7 +460,7 @@ class RohdeSchwarzHMC8043(TcpInstrument):
         """Enable/disable OUTPUT channel, do NOT change MASTER enable"""
         self.select_output(index)
         onoff = "ON" if ena else "OFF"
-        cmd = "OUTPut:CHAN {}".format(onoff)
+        cmd = f"OUTPut:CHAN {onoff}"
         self.write(cmd)
 
     def is_output_enabled(self, index):
@@ -466,7 +469,7 @@ class RohdeSchwarzHMC8043(TcpInstrument):
 
     def master_output_enable(self, ena):
         onoff = "ON" if ena else "OFF"
-        cmd = "OUTPUT:MASTER {}".format(onoff)
+        cmd = f"OUTPUT:MASTER {onoff}"
         self.write(cmd)
 
     def is_master_output_enabled(self):
@@ -487,14 +490,11 @@ class RohdeSchwarzHMC8043(TcpInstrument):
         return float(self.query("MEASure:VOLT?"))
 
     def print_status(self):
-        print("Master: {}".format("ON" if self.is_master_output_enabled() else "off"))
+        onoff = "ON" if self.is_master_output_enabled() else "off"
+        print(f"Master: {onoff}")
         for i in range(1, self.num_chans + 1):
-            print("Chan {}: {} {:6.3f} V {:6.3f} A  CUR:{:6.3f} A".format(
-                i, "ON " if self.is_output_enabled(i) else "off",
-                self.get_voltage(i),
-                self.get_current(i),
-                self.meas_current(i),
-            ))
+            onoff = "ON " if self.is_output_enabled(i) else "off"
+            print(f"Chan {i}: {onoff} {self.get_voltage(i):6.3f} V {self.get_current(i):6.3f} A  CUR:{self.meas_current(i):6.3f} A")
 
 ################################################################################
 #
@@ -561,7 +561,7 @@ class CmdFuncProxy(object):
                     param = sig.parameters[param_name]
                     if param.default is not inspect.Parameter.empty:
                         syntax_param_name += "=" + str(param.default)
-                    params_ltge.append("<{}>".format(syntax_param_name))
+                    params_ltge.append(f"<{syntax_param_name}>")
                 syntax += "=" + ",".join(params_ltge[1:])
 
             docstr0 = inspect.getdoc(func)
@@ -578,15 +578,16 @@ class CmdFuncProxy(object):
         if len(found) == 1:
             return found[0]
         if len(found) > 1:
-            raise ValueError("Ambiguous command: '{}' matches '{}'".format(name, "', '".join(found)))
+            found_str = "', '".join(found)
+            raise ValueError(f"Ambiguous command: '{name}' matches '{found_str}'")
         if not found:
-            raise ValueError("Unknown command: '{}'".format(name))
+            raise ValueError(f"Unknown command: '{name}'")
 
     def execute(self, cmds):
         for cmd in cmds:
             m = re.match("([a-z_]+)(.*)", cmd)
             if not m:
-                raise ValueError("Unknown command: {}".format(cmd))
+                raise ValueError(f"Unknown command: {cmd}")
 
             name = m.group(1)
             allargs = m.group(2)
@@ -615,14 +616,11 @@ class CmdFuncProxy(object):
 
             if len(args) < num_params_required:
                 if num_params_required == len(param_names):
-                    raise ValueError("Expected {} param(s) for '{}' but got {}: {}".format(
-                        len(param_names), name, len(args), args))
+                    raise ValueError(f"Expected {len(param_names)} param(s) for '{name}' but got {len(args)}: {args}")
                 else:
-                    raise ValueError("Expected min {}, max {} param(s) for '{}' but got {}: {}".format(
-                        num_params_required, len(param_names), name, len(args), args))
+                    raise ValueError(f"Expected min {num_params_required}, max {len(param_names)} param(s) for '{name}' but got {len(args)}: {args}")
             if len(args) > len(param_names):
-                raise ValueError("Expected max {} param(s) for '{}' but got {}: {}".format(
-                        len(param_names), name, len(args), args))
+                raise ValueError(f"Expected max {len(param_names)} param(s) for '{name}' but got {len(args)}: {args}")
 
             # Prepare argument dictionary for the method call
             for i, arg in enumerate(args):
@@ -724,16 +722,16 @@ Measure current of channel 2, report if change is > 3%, 100 reports
         def print_meas():
             dt = now - time_last
             ts_ms = int(1000 * (now - (int(now))))
-            ts = "{:s}.{:03d}".format(time.strftime("%H:%M:%S"), ts_ms)
+            ts = f"{time.strftime('%H:%M:%S'):s}.{ts_ms:03d}"
             print("{}  {:6.3f}s  {:5.0f} {:+5.0f}  {:3.0f}%".format(
                 ts, dt, 1000 * cur, 1000 * cur_d, cur_d_pct))
 
         msg = ""
         if d_pct > 0:
-            msg += "report if change > {:.0f}%, ".format(d_pct)
+            msg += f"report if change > {d_pct:.0f}%, "
         if num and num >= 2:
-            msg += "{:.0f} reports".format(num)
-            Log.note("Measuring current for {}s, {}".format(secs, msg))
+            msg += f"{num:.0f} reports"
+            Log.note(f"Measuring current for {secs}s, {msg}")
             print("Time               dt   I/mA dI/mA d/pct")
 
         now = time.monotonic()
@@ -777,8 +775,8 @@ def parser_create():
     cmd_syntaxes = "Commands:\n"
     for syntax, doc in cmds:
         #cmd_syntaxes += "  {:{}s}\n    {}\n".format(syntax, width_max, doc)
-        cmd_syntaxes += "  {}\n      {}\n".format(syntax, doc)
-    cmd_syntaxes += "\nCommands can be abbreviated. Default command is: {}".format(CMD_DEFAULT)
+        cmd_syntaxes += f"  {syntax}\n      {doc}\n"
+    cmd_syntaxes += f"\nCommands can be abbreviated. Default command is: {CMD_DEFAULT}"
 
     parser = argparse.ArgumentParser(formatter_class=argparse.RawTextHelpFormatter,
         description=description, epilog=cmd_syntaxes, add_help=False)
@@ -815,11 +813,11 @@ def main():
         psu_cmdline = PSUCmdFuncProxy(psu)
         psu_cmdline.execute(opt.cmds)
 
-        Log.info("{:.0f}ms".format(psu.time_for_queries * 1000))
+        Log.info(f"{psu.time_for_queries * 1000:.0f}ms")
     except (ValueError, EnvironmentError, RuntimeError) as e:
         if opt.debug:
             raise
-        sys.stderr.write("ERROR: {}\n".format(e))
+        sys.stderr.write(f"ERROR: {e}\n")
         sys.stderr.write("Tip: run with -d option to see full stack trace\n")
         sys.exit(1)
 
@@ -829,10 +827,11 @@ if __name__ == "__main__":
     if opt.help:
         if opt.help == 1:
             parser.print_help()
-            print("(Python {})".format(sys.version.split()[0]))
+            print(f"(Python {sys.version.split()[0]})")
         elif opt.help == 2:
             PSUCmdFuncProxy.print_examples()
         sys.exit(0)
 
     Log.verbose = opt.verbose
+
     main()
