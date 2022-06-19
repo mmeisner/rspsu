@@ -841,6 +841,68 @@ Measure current of channel 2, report if change is > 3%, 100 reports
 # Main And Argument Parsing
 ################################################################################
 
+class XDG(object):
+    """
+    Small python class to get XDG standard directory paths according to the
+    XDG Base Directory Specification:
+    https://specifications.freedesktop.org/basedir-spec/latest/ar01s02.html
+    """
+    @staticmethod
+    def _path_get(name, default, path=None):
+        d = os.environ.get(name, None)
+        if not d:
+            d = os.path.expanduser(f"~/{default}")
+        if path:
+            d = os.path.join(d, path)
+        return d
+
+    @staticmethod
+    def config_home(path=None):
+        """
+        $XDG_CONFIG_HOME defines the base directory relative to which user
+        specific configuration files should be stored. If $XDG_CONFIG_HOME
+        is either not set or empty, a default equal to $HOME/.config should be used.
+        """
+        return XDG._path_get("XDG_CONFIG_HOME", ".config", path)
+
+    @staticmethod
+    def config_path():
+        filename = os.path.basename(__file__)
+        return XDG.config_home(f"{filename}.conf")
+
+
+def config_read():
+    config_path = XDG.config_path()
+    if not os.path.isfile(config_path):
+        Log.verb(f"Config file '{config_path}' not found")
+        return None, None
+
+    Log.verb(f"Reading config file '{config_path}'")
+    with open(config_path, "r") as f:
+        lines = f.readlines()
+
+    num_lines = 0
+    i, phy, device = 0, None, None
+    for i, line in enumerate(lines, 1):
+        line = line.strip()
+        if line.startswith("#") or not line:
+            continue
+        num_lines += 1
+
+        parts = line.split(" ")
+        if not len(parts) == 2:
+            raise ValueError(f"""Syntax error at line {i}, expected one of:
+tcp IPADDR[:PORT]
+ser /dev/serial/by-id/usb-Rohde_Schwarz_HMC8043_VCPxxxxxxxxx-if00
+    where IPADDR is the IP address
+    and xxxxxxxxx is the ID of the USB serial device
+""")
+        phy, device = parts
+
+    Log.verb(f"Parsed {num_lines} of {i} lines from config file '{config_path}'")
+    return phy, device
+
+
 def parser_create():
     description = f"""\
 Remote control of Rohde & Schwarz HM804x PSU (over TCP/IP or USB-serial/VCP)
@@ -900,7 +962,7 @@ def main():
 
         if opt.hostandport.startswith("/dev"):
             driver = SerialDriver(opt.hostandport)
-        else:
+        elif opt.hostandport != "":
             if ":" in opt.hostandport:
                 ipaddr, port = opt.hostandport.split(":")
             else:
@@ -908,6 +970,14 @@ def main():
                 if not ipaddr:
                     ipaddr = HOSTNAME_DEFAULT
             driver = TcpDriver(host=ipaddr, port=port)
+        else:
+            phy, device = config_read()
+            if phy == "tcp":
+                driver = TcpDriver(host=device, port=PORT_DEFAULT)
+            elif phy == "ser":
+                driver = SerialDriver(device)
+            else:
+                raise RuntimeError("No instrument connection method/interface supplied")
 
         psu = RohdeSchwarzHMC8043(driver)
         psu_cmdline = PSUCmdFuncProxy(psu)

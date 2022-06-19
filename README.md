@@ -2,6 +2,7 @@
 
 This is a simple Python3 command-line utility that can remote control
 Rohde & Schwarz HMC8041, HMC8042 and HMC8043 PSUs (from here-on called HMC804x)
+over either TCP/IP or USB.
 
 The script has no dependencies apart from the Python3 standard library.
 
