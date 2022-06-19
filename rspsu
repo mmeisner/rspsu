@@ -10,6 +10,7 @@ import socket
 import re
 import enum
 import inspect
+import serial
 from pprint import pprint
 
 PORT_DEFAULT=5025
@@ -259,27 +260,62 @@ def zeroconf_scan(arg):
 #
 ################################################################################
 
-class TcpInstrument(object):
+class InstrumentDriver:
+
+    def open(self):
+        raise NotImplementedError()
+
+    def close(self):
+        raise NotImplementedError()
+
+    def write(self, s):
+        raise NotImplementedError()
+
+    def read(self, timeout=None):
+        raise NotImplementedError()
+
+
+class TcpDriver(InstrumentDriver):
     """
     TCP client that uses ASCII protocol with '\n' as message terminator
     """
-    def __init__(self, family=socket.AF_INET):
+    def __init__(self, host=None, port=None, flags=0, family=socket.AF_INET):
+        super().__init__()
+        # Split host into IPADDR and PORT
+        if ":" in host:
+            host, port = host.rsplit(":", maxsplit=2)
+        self.host = host
+        self.port = port
+        self.flags = flags
         self.family = family
         self.sock = None
 
-        self.time_for_queries = 0
+    def __str__(self):
+        return f"<{self.__class__.__name__}@{self.sock.getpeername()[0]}>"
 
-    def connect(self, host, port, flags=0):
-        #Log.verb("TCP connecting to {}:{}", host, port)
-        for res in socket.getaddrinfo(host, port, self.family, socket.SOCK_STREAM,
-                                      flags=flags|socket.AI_CANONNAME):
+    def open(self):
+        Log.verb(f"TCP connecting to {self.host}:{self.port}")
+        for res in socket.getaddrinfo(
+                self.host, self.port, self.family, socket.SOCK_STREAM,
+                flags=self.flags|socket.AI_CANONNAME):
             af, socktype, proto, canonname, sa = res
             try:
                 self.sock = socket.socket(af, socktype, proto)
                 self.sock.connect(sa)
                 self.sock.settimeout(1)
-                Log.verb(f"TCP connected to {host} port {port} timeout={self.sock.gettimeout()}s")
+                Log.verb(f"TCP connected to {self.host} port {self.port} timeout={self.sock.gettimeout()}s")
+
+                # Work-around for HM804x bug where a pending response to the previously
+                # connected client is just sent to the next connecting client.
+                # Thus we have to start with a flush.
+                try:
+                    r = self.read(timeout=0.01)
+                    if r:
+                        print("Flushed HMC804x transmit buffer:", repr(r))
+                except socket.timeout:
+                    pass
                 return
+
             except OSError as e:
                 self.sock.close()
                 self.sock = None
@@ -307,6 +343,64 @@ class TcpInstrument(object):
             if timeout:
                 self.sock.settimeout(tout_saved)
 
+
+class SerialDriver(InstrumentDriver):
+    """
+    Serial/VCP (Virtual Com Port) client using ASCII protocol with '\n' as message terminator
+    """
+    def __init__(self, device=None):
+        super().__init__()
+        self.device = device
+        self.serial = None
+
+    def __str__(self):
+        return f"<{self.__class__.__name__}@{self.serial}>"
+
+    def open(self):
+        Log.verb(f"{self.__class__.__name__} opening {self.device}")
+        try:
+            self.serial = serial.Serial(port=self.device, baudrate=115200, exclusive=True, rtscts=True)
+        except:
+            raise RuntimeError(f"failed to open USB-serial device {self.device}")
+
+    def close(self):
+        self.serial.close()
+
+    def write(self, s):
+        Log.info(f"send: {s}")
+        self.serial.write(s.encode('ascii') + b"\r\n")
+
+    def read(self, timeout=None):
+        if timeout:
+            tout_saved = self.serial.timeout
+            self.serial.timeout = timeout
+        try:
+            data = self.serial.read_until(size=1024)
+            text = data.decode('ascii').strip()
+            Log.info(f"recv: {text}")
+            return text
+        finally:
+            if timeout:
+                self.serial.timeout = tout_saved
+
+
+class InstrumentBase:
+    def __init__(self, driver):
+        self.time_for_queries = 0
+        self.driver = driver
+
+    def open(self):
+        return self.driver.open()
+
+    def close(self):
+        return self.driver.close()
+
+    def write(self, s):
+        return self.driver.write(s)
+
+    def read(self, timeout=None):
+        return self.driver.read(timeout=timeout)
+
     def query(self, s):
         started = time.time()
         self.write(s)
@@ -332,7 +426,7 @@ class TcpInstrument(object):
 #
 ################################################################################
 
-class RohdeSchwarzHMC8043(TcpInstrument):
+class RohdeSchwarzHMC8043(InstrumentBase):
     """
     R&S®HMC804x Power Supply SCPI Programmers Manual
       https://www.rohde-schwarz.com/us/manual/r-s-hmc804x-power-supply-scpi-programmers-manual-manuals-gb1_78701-172161.html
@@ -342,32 +436,14 @@ class RohdeSchwarzHMC8043(TcpInstrument):
       https://scdn.rohde-schwarz.com/ur/pws/dl_downloads/dl_common_library/dl_manuals/gb_1/h/hmc804x/HMC804x_UserManual_de_en_04.pdf
 
     """
-    TCP_PORT = 5025
 
-    def __init__(self, host, port=5025):
-        super().__init__()
-
-        Log.verb(f"Opening {self.__class__.__name__} @ {host}:{port}")
-        self.connect(host, port)
+    def __init__(self, driver):
+        super().__init__(driver)
+        self.open()
 
         self._selected_output = None
         self.id = None
         self._num_chans = None
-
-    def __str__(self):
-        return f"<{self.__class__.__name__}@{self.sock.getpeername()[0]}>"
-
-    def connect(self, *args, **kwargs):
-        super().connect(*args, **kwargs)
-        # Work-around for HM804x bug where a pending response to the previously
-        # connected client is just sent to the next connecting client.
-        # Thus we have to start with a flush.
-        try:
-            r = self.read(timeout=0.01)
-            if r:
-                print("Flushed HMC804x transmit buffer:", repr(r))
-        except socket.timeout:
-            pass
 
     def _ask_bool(self, cmd):
         r = self.query(cmd)
@@ -424,7 +500,6 @@ class RohdeSchwarzHMC8043(TcpInstrument):
             return
         errmsg = f'{self} returned error: {err},"{msg}"'
         raise RuntimeError(errmsg)
-
 
     def select_output(self, index):
         index = int(index)
@@ -494,6 +569,7 @@ class RohdeSchwarzHMC8043(TcpInstrument):
         for i in range(1, self.num_chans + 1):
             onoff = "ON " if self.is_output_enabled(i) else "off"
             print(f"Chan {i}: {onoff} {self.get_voltage(i):6.3f} V {self.get_current(i):6.3f} A  CUR:{self.meas_current(i):6.3f} A")
+
 
 ################################################################################
 #
@@ -766,7 +842,9 @@ Measure current of channel 2, report if change is > 3%, 100 reports
 ################################################################################
 
 def parser_create():
-    description = """Remote control of Rohde & Schwarz HM804x PSU (over TCP/IP)
+    description = f"""\
+Remote control of Rohde & Schwarz HM804x PSU (over TCP/IP or USB-serial/VCP)
+Connection method is read from config file at {XDG.config_path()}
 """
 
     cmds = [ (syntax, doc) for syntax, doc in PSUCmdFuncProxy.iter_syntax_docstr0() ]
@@ -778,14 +856,17 @@ def parser_create():
         cmd_syntaxes += f"  {syntax}\n      {doc}\n"
     cmd_syntaxes += f"\nCommands can be abbreviated. Default command is: {CMD_DEFAULT}"
 
-    parser = argparse.ArgumentParser(formatter_class=argparse.RawTextHelpFormatter,
+    parser = argparse.ArgumentParser(formatter_class=argparse.RawDescriptionHelpFormatter,
         description=description, epilog=cmd_syntaxes, add_help=False)
 
     parser.add_argument(dest='cmds', metavar='CMD', type=str, nargs='*', default=[CMD_DEFAULT],
         help="One or more commands to execute")
 
-    parser.add_argument('-c', dest='hostandport', metavar="HOST", default=HOSTNAME_DEFAULT,
-        help="Host (and port) to connect to. Default is " + HOSTNAME_DEFAULT)
+    parser.add_argument('-c', dest='hostandport', metavar="HOST", default="",
+        help=f"""TCP Host (and port) to connect to or
+USB-serial device to use (e.g. /dev/serial/by-id/usb-Rohde_Schwarz_HMC804x_xxxxxx-if00).
+If HOST starts with 'mdns:' the hostname will be looked up using mDNS
+(provided that python zeroconf is installed)""")
 
     zeroconf_add_argument(parser)
 
@@ -817,12 +898,18 @@ def main():
             zeroconf_scan(opt.zeroconf)
             sys.exit(0)
 
-        if ":" in opt.hostandport:
-            ipaddr, port = opt.hostandport.split(":")
+        if opt.hostandport.startswith("/dev"):
+            driver = SerialDriver(opt.hostandport)
         else:
-            ipaddr, port = opt.hostandport, PORT_DEFAULT
+            if ":" in opt.hostandport:
+                ipaddr, port = opt.hostandport.split(":")
+            else:
+                ipaddr, port = opt.hostandport, PORT_DEFAULT
+                if not ipaddr:
+                    ipaddr = HOSTNAME_DEFAULT
+            driver = TcpDriver(host=ipaddr, port=port)
 
-        psu = RohdeSchwarzHMC8043(ipaddr)
+        psu = RohdeSchwarzHMC8043(driver)
         psu_cmdline = PSUCmdFuncProxy(psu)
         psu_cmdline.execute(opt.cmds)
 
