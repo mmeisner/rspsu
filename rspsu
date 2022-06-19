@@ -285,14 +285,13 @@ class TcpInstrument(object):
                 self.sock = None
                 continue
 
-        raise RuntimeError(f"TCP connection to {host} port {port} failed")
-
+        raise RuntimeError(f"TCP connection to {self.host} port {self.port} failed")
 
     def close(self):
         self.sock.close()
 
     def write(self, s):
-        Log.info("send: {}", s)
+        Log.info(f"send: {s}")
         self.sock.send(s.encode('ascii') + b"\n")
 
     def read(self, timeout=None):
@@ -700,7 +699,7 @@ Measure current of channel 2, report if change is > 3%, 100 reports
 
     def cmd_wait(self, SECONDS):
         """Sleep SECONDS"""
-        Log.info("wait: {:.1f}s", SECONDS)
+        Log.info(f"wait: {SECONDS:.1f}s")
         time.sleep(SECONDS)
 
     def cmd_status(self):
@@ -723,8 +722,9 @@ Measure current of channel 2, report if change is > 3%, 100 reports
             dt = now - time_last
             ts_ms = int(1000 * (now - (int(now))))
             ts = f"{time.strftime('%H:%M:%S'):s}.{ts_ms:03d}"
-            print("{}  {:6.3f}s  {:5.0f} {:+5.0f}  {:3.0f}%".format(
-                ts, dt, 1000 * cur, 1000 * cur_d, cur_d_pct))
+            cur_amps = 1000 * cur
+            cur_amps_d = 1000 * cur_d
+            print(f"{ts}  {dt:6.3f}s  {cur_amps:5.0f} {cur_amps_d:+5.0f}  {cur_d_pct:3.0f}%")
 
         msg = ""
         if d_pct > 0:
