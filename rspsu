@@ -798,7 +798,20 @@ def parser_create():
 
     return parser
 
+
 def main():
+    parser = parser_create()
+    opt = parser.parse_args()
+    if opt.help:
+        if opt.help == 1:
+            parser.print_help()
+            print(f"(Python {sys.version.split()[0]})")
+        elif opt.help == 2:
+            PSUCmdFuncProxy.print_examples()
+        sys.exit(0)
+
+    Log.verbose = opt.verbose
+
     try:
         if opt.zeroconf:
             zeroconf_scan(opt.zeroconf)
@@ -821,17 +834,6 @@ def main():
         sys.stderr.write("Tip: run with -d option to see full stack trace\n")
         sys.exit(1)
 
+
 if __name__ == "__main__":
-    parser = parser_create()
-    opt = parser.parse_args()
-    if opt.help:
-        if opt.help == 1:
-            parser.print_help()
-            print(f"(Python {sys.version.split()[0]})")
-        elif opt.help == 2:
-            PSUCmdFuncProxy.print_examples()
-        sys.exit(0)
-
-    Log.verbose = opt.verbose
-
     main()
