@@ -782,6 +782,16 @@ Measure current of channel 2, report if change is > 3%, 100 reports
         """Print instrument status for all outputs"""
         self.inst.print_status()
 
+    def cmd_errors(self):
+        """Read (and clear) all queued errors"""
+        errcode, msg = 1, ""
+        for i in range(20):
+            errcode, msg = self.inst.query_system_error()
+            if errcode != 0 :
+                print(f"read error {errcode},{msg}")
+            else:
+                break
+
     def cmd_mi(self, chan, num=0, d_pct=3, secs=9999, freq=5):
         """Measure output current for some time or number of reports
 
