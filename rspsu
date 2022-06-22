@@ -575,7 +575,7 @@ class RohdeSchwarzHMC8043(InstrumentBase):
 #
 ################################################################################
 
-class CmdFuncProxy(object):
+class CmdFuncProxy:
     """
     Class that more or less magically turns derived classes into commandline
     classes, i.e. each method that starts with `cmd_` in the derived class
@@ -782,7 +782,7 @@ Measure current of channel 2, report if change is > 3%, 100 reports
         """Print instrument status for all outputs"""
         self.inst.print_status()
 
-    def cmd_mi(self, chan, num=None, d_pct=3, secs=9999, freq=10):
+    def cmd_mi(self, chan, num=0, d_pct=3, secs=9999, freq=5):
         """Measure output current for some time or number of reports
 
         :param chan:  Output channel
@@ -804,11 +804,11 @@ Measure current of channel 2, report if change is > 3%, 100 reports
 
         msg = ""
         if d_pct > 0:
-            msg += f"report if change > {d_pct:.0f}%, "
+            msg += f"report if change > {d_pct:.0f}%"
         if num and num >= 2:
-            msg += f"{num:.0f} reports"
-            Log.note(f"Measuring current for {secs}s, {msg}")
-            print("Time               dt   I/mA dI/mA d/pct")
+            msg += f", max {num:.0f} reports"
+        Log.note(f"Measuring current for {secs}s, {msg}, sample rate = {freq:.0f}Hz")
+        print("Time               dt   I/mA dI/mA d/pct")
 
         now = time.monotonic()
         time_last = now
@@ -819,7 +819,10 @@ Measure current of channel 2, report if change is > 3%, 100 reports
         num_done += 1
 
         deadline = time_last + secs
-        while num is not None and num_done < num:
+        while True:
+            if num != 0 and num_done >= num:
+                break
+
             now = time.monotonic()
             if now > deadline:
                 break
@@ -841,7 +844,7 @@ Measure current of channel 2, report if change is > 3%, 100 reports
 # Main And Argument Parsing
 ################################################################################
 
-class XDG(object):
+class XDG:
     """
     Small python class to get XDG standard directory paths according to the
     XDG Base Directory Specification:
