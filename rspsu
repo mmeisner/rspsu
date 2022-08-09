@@ -1003,6 +1003,9 @@ def main():
         sys.stderr.write(f"ERROR: {e}\n")
         sys.stderr.write("Tip: run with -d option to see full stack trace\n")
         sys.exit(1)
+    except KeyboardInterrupt:
+        print()
+        return
 
 
 if __name__ == "__main__":
